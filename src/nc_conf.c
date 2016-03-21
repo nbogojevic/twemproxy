@@ -248,26 +248,26 @@ conf_pool_deinit(struct conf_pool *cp)
 }
 
 rstatus_t
-conf_pool_each_transform(void *elem, void *data)
+conf_pool_to_server_pool(struct conf_pool *cp, struct array *server_pool, struct server_pool *sp, bool initial)
 {
     rstatus_t status;
-    struct conf_pool *cp = elem;
-    struct array *server_pool = data;
-    struct server_pool *sp;
-
-    ASSERT(cp->valid);
-
-    sp = array_push(server_pool);
-    ASSERT(sp != NULL);
 
     sp->idx = array_idx(server_pool, sp);
-    sp->ctx = NULL;
+    if (initial) {
+        sp->ctx = NULL;
 
-    sp->p_conn = NULL;
-    sp->nc_conn_q = 0;
-    TAILQ_INIT(&sp->c_conn_q);
+        sp->p_conn = NULL;
+        sp->nc_conn_q = 0;
+        TAILQ_INIT(&sp->c_conn_q);
 
-    array_null(&sp->server);
+        array_null(&sp->server);
+    } else {
+        if (sp->continuum != NULL) {
+            nc_free(sp->continuum);
+        }
+
+        server_deinit(&sp->server);
+    }
     sp->ncontinuum = 0;
     sp->nserver_continuum = 0;
     sp->continuum = NULL;
@@ -312,6 +312,19 @@ conf_pool_each_transform(void *elem, void *data)
               sp->name.len, sp->name.data);
 
     return NC_OK;
+}
+
+rstatus_t
+conf_pool_each_transform(void *elem, void *data)
+{
+    struct conf_pool *cp = elem;
+    struct array *server_pool = data;
+    struct server_pool *sp;
+    ASSERT(cp->valid);
+
+    sp = array_push(server_pool);
+    ASSERT(sp != NULL);
+    return conf_pool_to_server_pool(cp, server_pool, sp, true);
 }
 
 static void
@@ -1809,3 +1822,49 @@ conf_set_hashtag(struct conf *cf, struct command *cmd, void *conf)
 
     return CONF_OK;
 }
+
+
+/*
+ * Re-configures existing server pool from corresponding configuration. This method
+ * will allow re-setting configuration when cluster configuration completely changed (e.g. all cluster
+ * nodes went down, service restarted, all IP addresses changed, none of known nodes respond to
+ * cluster queries). If cluster was specified via DNS name, this function will repopulate
+ * server pool with addresses of newly resolved IP. Pool will then be started and cluster
+ * can be polled to get slot distribution.
+ */
+rstatus_t
+conf_reconfigure_pool(struct server_pool *pool)
+{
+    uint32_t pool_idx;
+    rstatus_t status;
+
+    struct context *ctx = pool->ctx;
+    struct conf *conf = ctx->cf;
+    uint32_t pool_size = array_n(&conf->pool);
+    for (pool_idx = 0; pool_idx < pool_size; pool_idx++) {
+        struct conf_pool *conf_pool = array_get(&conf->pool, pool_idx);
+        if (string_compare(&conf_pool->name, &pool->name) == 0) {
+            ctx->max_nsconn -= pool->server_connections * array_n(&pool->server);
+            ctx->max_nsconn -= 1; /* reduce pool listening socket */
+
+            status = conf_pool_to_server_pool(conf_pool, &ctx->pool, pool, false);
+            if (status != NC_OK) {
+                log_error("Unable to re-start pool %.*s not found. There is something wrong", pool->name.len, pool->name.data);
+                return status;
+            }
+            pool->ctx = ctx;
+
+            /* compute max server connections */
+            ctx->max_nsconn += pool->server_connections * array_n(&pool->server);
+            ctx->max_nsconn += 1; /* pool listening socket */
+
+            /* update server pool continuum */
+            server_pool_run(pool);
+
+            return NC_OK;
+        }
+    }
+    log_error("Configuration pool %.*s not found. There is something wrong", pool->name.len, pool->name.data);
+    return NC_ERROR;
+}
+

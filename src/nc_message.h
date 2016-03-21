@@ -26,6 +26,7 @@ typedef rstatus_t (*msg_fragment_t)(struct msg *, uint32_t, struct msg_tqh *);
 typedef void (*msg_coalesce_t)(struct msg *r);
 typedef rstatus_t (*msg_reply_t)(struct msg *r);
 typedef bool (*msg_failure_t)(struct msg *r);
+typedef bool (*msg_redirect_t)(struct context *ctx, struct conn *conn, struct msg *msg, struct msg *pmsg);
 
 typedef enum msg_parse_result {
     MSG_PARSE_OK,                         /* parsing ok */
@@ -182,10 +183,14 @@ typedef enum msg_parse_result {
     ACTION( RSP_REDIS_ERROR_EXECABORT )                                                             \
     ACTION( RSP_REDIS_ERROR_MASTERDOWN )                                                            \
     ACTION( RSP_REDIS_ERROR_NOREPLICAS )                                                            \
+    ACTION( RSP_REDIS_ERROR_TRYAGAIN )                                                            \
     ACTION( RSP_REDIS_INTEGER )                                                                     \
     ACTION( RSP_REDIS_BULK )                                                                        \
     ACTION( RSP_REDIS_MULTIBULK )                                                                   \
     ACTION( SENTINEL )                                                                              \
+    ACTION( RSP_REDIS_ERROR_MOVED )                                                                 \
+    ACTION( RSP_REDIS_ERROR_ASK )                                                                   \
+    ACTION( REQ_REDIS_CLUSTER_SLOTS )                                                               \
 
 
 #define DEFINE_ACTION(_name) MSG_##_name,
@@ -225,6 +230,7 @@ struct msg {
     msg_reply_t          reply;           /* generate message reply (example: ping) */
     msg_add_auth_t       add_auth;        /* add auth message when we forward msg */
     msg_failure_t        failure;         /* transient failure response? */
+    msg_redirect_t       redirect;        /* process message if redirect */
 
     msg_coalesce_t       pre_coalesce;    /* message pre-coalesce */
     msg_coalesce_t       post_coalesce;   /* message post-coalesce */

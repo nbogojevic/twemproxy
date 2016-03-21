@@ -138,4 +138,7 @@ rstatus_t conf_pool_each_transform(void *elem, void *data);
 struct conf *conf_create(char *filename);
 void conf_destroy(struct conf *cf);
 
+rstatus_t conf_pool_to_server_pool(struct conf_pool *cp, struct array *server_pool, struct server_pool *sp, bool initial);
+rstatus_t conf_reconfigure_pool(struct server_pool *pool);
+
 #endif

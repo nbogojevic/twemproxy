@@ -149,6 +149,13 @@ rstatus_t memcache_reply(struct msg *r);
 void memcache_post_connect(struct context *ctx, struct conn *conn, struct server *server);
 void memcache_swallow_msg(struct conn *conn, struct msg *pmsg, struct msg *msg);
 
+struct slot_mapping {
+    uint16_t      lo_slot;
+    uint16_t      hi_slot;
+    struct string host;       /* hostname */
+    uint16_t      port;       /* port */
+};
+
 void redis_parse_req(struct msg *r);
 void redis_parse_rsp(struct msg *r);
 bool redis_failure(struct msg *r);
@@ -159,5 +166,12 @@ rstatus_t redis_fragment(struct msg *r, uint32_t ncontinuum, struct msg_tqh *fra
 rstatus_t redis_reply(struct msg *r);
 void redis_post_connect(struct context *ctx, struct conn *conn, struct server *server);
 void redis_swallow_msg(struct conn *conn, struct msg *pmsg, struct msg *msg);
+void redis_send_cluster_slots_next_server(struct server_pool* pool, struct server *last_server);
+void redis_send_cluster_slots(struct context *ctx, struct conn *conn, struct server *server);
+rstatus_t redis_slot_update_from_response(struct server_pool* pool, struct msg *msg);
+rstatus_t redis_on_cluster_slots_result(struct server_pool *pool, struct array *slot_responses);
+bool redis_redirect(struct context *ctx, struct conn *conn, struct msg *msg, struct msg *pmsg);
+
+#define NC_SLOT_ARRAY_SIZE 128
 
 #endif

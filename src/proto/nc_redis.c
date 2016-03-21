@@ -19,8 +19,12 @@
 #include <ctype.h>
 #include <math.h>
 
+#include <netdb.h>
+
 #include <nc_core.h>
-#include <nc_proto.h>
+#include <proto/nc_proto.h>
+
+uint32_t server_find_by_address_or_add(struct server_pool *pool, struct string *addr, int port);
 
 #define RSP_STRING(ACTION)                                                          \
     ACTION( ok,               "+OK\r\n"                                           ) \
@@ -28,10 +32,13 @@
     ACTION( invalid_password, "-ERR invalid password\r\n"                         ) \
     ACTION( auth_required,    "-NOAUTH Authentication required\r\n"               ) \
     ACTION( no_password,      "-ERR Client sent AUTH, but no password is set\r\n" ) \
+    ACTION( redirect_error,   "-ERR error on cluster redirect:"                   ) \
 
 #define DEFINE_ACTION(_var, _str) static struct string rsp_##_var = string(_str);
     RSP_STRING( DEFINE_ACTION )
 #undef DEFINE_ACTION
+
+static struct string prefix_asking = string("ASKING");
 
 static rstatus_t redis_handle_auth_req(struct msg *request, struct msg *response);
 
@@ -338,6 +345,7 @@ redis_error(struct msg *r)
     case MSG_RSP_REDIS_ERROR_EXECABORT:
     case MSG_RSP_REDIS_ERROR_MASTERDOWN:
     case MSG_RSP_REDIS_ERROR_NOREPLICAS:
+    case MSG_RSP_REDIS_ERROR_TRYAGAIN:
         return true;
 
     default:
@@ -346,6 +354,8 @@ redis_error(struct msg *r)
 
     return false;
 }
+
+
 
 /*
  * Reference: http://redis.io/topics/protocol
@@ -1823,6 +1833,11 @@ redis_parse_rsp(struct msg *r)
                      * -ERR source and destination objects are the same\r\n
                      * -ERR index out of range\r\n
                      */
+                    if (str4cmp(m, '-', 'A', 'S', 'K')) {
+                        r->type = MSG_RSP_REDIS_ERROR_ASK;
+                        break;
+                    }
+
                     if (str4cmp(m, '-', 'E', 'R', 'R')) {
                         r->type = MSG_RSP_REDIS_ERROR_ERR;
                         break;
@@ -1840,6 +1855,15 @@ redis_parse_rsp(struct msg *r)
                     /* -BUSY Redis is busy running a script. You can only call SCRIPT KILL or SHUTDOWN NOSAVE.\r\n" */
                     if (str5cmp(m, '-', 'B', 'U', 'S', 'Y')) {
                         r->type = MSG_RSP_REDIS_ERROR_BUSY;
+                        break;
+                    }
+
+                    break;
+
+                case 6:
+                    /* -MOVED Redis slot has moved.\r\n" */
+                    if (str6cmp(m, '-', 'M', 'O', 'V', 'E', 'D')) {
+                        r->type = MSG_RSP_REDIS_ERROR_MOVED;
                         break;
                     }
 
@@ -1885,6 +1909,12 @@ redis_parse_rsp(struct msg *r)
                     /* -READONLY You can't write against a read only slave.\r\n */
                     if (str9cmp(m, '-', 'R', 'E', 'A', 'D', 'O', 'N', 'L', 'Y')) {
                         r->type = MSG_RSP_REDIS_ERROR_READONLY;
+                        break;
+                    }
+
+                    /* -TRYAGAIN multi key operation during resharding.\r\n */
+                    if (str9cmp(m, '-', 'T', 'R', 'Y', 'A', 'G', 'A', 'I', 'N')) {
+                        r->type = MSG_RSP_REDIS_ERROR_TRYAGAIN;
                         break;
                     }
 
@@ -2126,6 +2156,7 @@ redis_parse_rsp(struct msg *r)
                     break;
                 }
 
+                // NBOTODO: why do we ignore this kind of elemens? Bulk should be possible within a bulk.
                 if (ch != '$') {
                     goto error;
                 }
@@ -2885,7 +2916,7 @@ redis_post_connect(struct context *ctx, struct conn *conn, struct server *server
      * a request 'SELECT <redis_db>', where <redis_db> is the configured
      * on a per pool basis in the configuration
      */
-    if (pool->redis_db <= 0) {
+    if (pool->redis_db <= 0 || pool->redis_cluster) {
         return;
     }
 
@@ -2944,5 +2975,595 @@ redis_swallow_msg(struct conn *conn, struct msg *pmsg, struct msg *msg)
         log_warn("SELECT %d failed on %s | %s: %s",
                  conn_pool->redis_db, conn_pool->name.data,
                  conn_server->name.data, message);
+    } else if (pmsg != NULL && pmsg->type == MSG_REQ_REDIS_CLUSTER_SLOTS) {
+        if (msg != NULL) {
+            struct server* conn_server;
+            struct server_pool* conn_pool;
+
+            conn_server = (struct server*)conn->owner;
+            conn_pool = conn_server->owner;
+            if (redis_error(msg)) {
+                struct mbuf* rsp_buffer;
+                uint8_t message[128];
+                size_t copy_len;
+
+                rsp_buffer = STAILQ_LAST(&msg->mhdr, mbuf, next);
+                copy_len = MIN(mbuf_length(rsp_buffer) - 3, sizeof(message) - 1);
+
+                nc_memcpy(message, &rsp_buffer->start[1], copy_len);
+                message[copy_len] = 0;
+
+                log_warn("CLUSTER SLOTS failed on %s | %s: %s",
+                    conn_pool->name.data,
+                    conn_server->name.data, message);
+                redis_send_cluster_slots_next_server(conn_pool, conn_server);
+            } else {
+                if (redis_slot_update_from_response(conn_pool, msg) != NC_OK) {
+                    redis_send_cluster_slots_next_server(conn_pool, conn_server);
+                }
+            }
+        }
     }
 }
+
+rstatus_t
+redis_extract_from_redirect(struct msg *msg, uint16_t* slot, struct string* addrstr, uint16_t* port) {
+    enum {
+        STATE_START_REDIRECT,
+        STATE_SLOT,
+        STATE_IP,
+        STATE_PORT
+    } state;
+    uint16_t v = 0;
+    uint8_t *p, ch;
+    uint8_t ip_pos = 0;
+    uint8_t ip[128];
+    struct mbuf *mbuf;
+
+    state = STATE_START_REDIRECT;
+    for (mbuf = STAILQ_FIRST(&msg->mhdr); mbuf != NULL; mbuf = STAILQ_NEXT(mbuf, next)) {
+        for (p = mbuf->pos; p < mbuf->last; p++) {
+            ch = *p;
+            switch (state) {
+            case STATE_START_REDIRECT:
+                if (ch == ' ') {
+                    state = STATE_SLOT;
+                    break;
+                } else if (ch == LF) {
+                    log_error("Invalid response on redirect message, got LF before slot number.");
+                    return NC_ERROR;
+                }
+                break;
+            case STATE_SLOT:
+                if (ch == ' ') {
+                    state = STATE_IP;
+                    break;
+                } else if (isdigit(ch)) {
+                    v = v * 10 + (ch - '0');
+                } else {
+                    log_error("Ivalid response on redirect message, expecting slot number, got %c", ch);
+                    return NC_ERROR;
+                }
+                break;
+            case STATE_IP:
+                if (ch == ' ') {
+                    state = STATE_PORT;
+                    v = 0;
+                    ip[ip_pos] = 0;
+                    string_copy(addrstr, ip, ip_pos);
+                    break;
+                } else if (ch == LF) {
+                    log_error("Invalid response on redirect message, got LF after IP address.");
+                    return NC_ERROR;
+                } else {
+                    if (ip_pos < sizeof(ip) - 1) {
+                        ip[ip_pos++] = ch;
+                    } else {
+                        ip[ip_pos] = 0;
+                        log_error("IP address for redirect was too long, got %.*s...",
+                            ip_pos, ip);
+                        return NC_ERROR;
+                    }
+                }
+                break;
+            case STATE_PORT:
+                if (isdigit(ch)) {
+                    v = v * 10 + (ch - '0');
+                } else {
+                    *port = v;
+                    return NC_OK;
+                }
+                break;
+            }
+        }
+    }
+    log_error("Invalid response on redirect message, didn't get all the information, last state was %d in enum{STATE_START_REDIRECT, STATE_SLOT, STATE_IP, STATE_PORT}", state);
+    return NC_ERROR;
+
+}
+
+bool
+redis_redirect(struct context *ctx, struct conn *conn, struct msg *msg, struct msg *pmsg)
+{
+    struct string addrstr;
+    struct conn *new_conn;
+    struct server *original_server, *new_server;
+    struct server_pool *pool;
+    uint16_t port;
+    uint16_t slot;
+    uint32_t idx;
+
+    if (pmsg != NULL && msg != NULL &&
+        (msg->type == MSG_RSP_REDIS_ERROR_MOVED || msg->type == MSG_RSP_REDIS_ERROR_ASK)) {
+        log_warn("Redis cluster moved message");
+        rstatus_t status = redis_extract_from_redirect(msg, &slot, &addrstr, &port);
+        if (status != NC_OK) {
+            msg_prepend(msg, rsp_redirect_error.data, rsp_redirect_error.len);
+            return false;
+        }
+        original_server = conn->owner;
+        pool = (struct server_pool *) original_server->owner;
+        idx = server_find_by_address_or_add(pool, &addrstr, port);
+        if (idx >= 0) {
+            new_server = array_get(&pool->server, idx);
+// Don't update continuum, do redirects until we get new cluster data from CLUSTR SLOTS
+// redis_add_to_continuum(pool, new_server, slot);
+            new_conn = server_conn(new_server);
+            if (msg->type == MSG_RSP_REDIS_ERROR_ASK) {
+                msg_prepend(pmsg, prefix_asking.data, prefix_asking.len);
+            }
+            req_server_enqueue_imsgq_head(ctx, new_conn, pmsg);
+            if (msg->type == MSG_RSP_REDIS_ERROR_MOVED) {
+                redis_send_cluster_slots(ctx, new_conn, new_server);
+            }
+        } else {
+            new_server = array_get(&pool->server, 0);
+            redis_send_cluster_slots(ctx, server_conn(new_server), new_server);
+        }
+        return true;
+    }
+    return false;
+}
+
+rstatus_t
+redis_parse_number(struct mbuf **mbuf, uint8_t **p, uint8_t start_char, uint16_t *value)
+{
+    enum {
+        SLOTS_NUM_START,
+        SLOTS_NUM_ARG,
+        SLOTS_NUM_ARG_LF,
+    } state;
+    uint8_t ch;
+    uint16_t v = 0;
+    bool first = true;
+
+    state = SLOTS_NUM_START;
+
+    for (; *mbuf != NULL; *mbuf = STAILQ_NEXT(*mbuf, next)) {
+        if (first) {
+            first = false;
+        } else {
+            *p = (*mbuf)->pos;
+        }
+        for (; *p < (*mbuf)->last; *p++) {
+            ch = **p;
+            switch (state) {
+            case SLOTS_NUM_START:
+                if (ch == start_char) {
+                    state = SLOTS_NUM_ARG;
+                    break;
+                }
+                return NC_ERROR;
+            case SLOTS_NUM_ARG:
+                if (ch == CR) {
+                    state = SLOTS_NUM_ARG_LF;
+                } else if (isdigit(ch)) {
+                    v = v * 10 + (ch - '0');
+                } else {
+                    return  NC_ERROR;
+                }
+                break;
+            case SLOTS_NUM_ARG_LF:
+                if (ch == LF) {
+                    *value = v;
+                    return NC_OK;
+                }
+            }
+        }
+    }
+    return NC_ERROR;
+}
+
+#pragma GCC diagnostic ignored "-Wmaybe-uninitialized"
+rstatus_t
+redis_slot_update_from_response(struct server_pool* pool, struct msg *msg)
+{
+    enum {
+        SLOTS_START,
+        SLOTS_RANGE,
+        SLOTS_LO_SLOT,
+        SLOTS_HI_SLOT,
+        SLOTS_MASTER,
+        SLOTS_MASTER_IP,
+        SLOTS_MASTER_IP_ARG,
+        SLOTS_MASTER_IP_LF,
+        SLOTS_MASTER_PORT,
+        SLOTS_SKIP_SLAVE
+    } state;
+    uint8_t *p;
+    uint8_t ch;
+    uint16_t slot_ranges;
+    uint16_t range_count = 0;
+    uint16_t slot_elements;
+    uint16_t master_elements;
+    uint8_t master_ip_pos;
+    uint8_t master_ip[128];
+    struct array slots;
+    struct mbuf *mbuf;
+    struct slot_mapping *mapping;
+    rstatus_t status;
+
+    status = array_init(&slots, NC_SLOT_ARRAY_SIZE, sizeof(struct slot_mapping));
+    if (status != NC_OK) {
+        log_error("Unable to initialize slot array");
+        return status;
+    }
+
+    state = SLOTS_START;
+    for (mbuf = STAILQ_FIRST(&msg->mhdr); mbuf != NULL; mbuf = STAILQ_NEXT(mbuf, next)) {
+        for (p = mbuf->pos; p < mbuf->last; p++) {
+            ch = *p;
+            switch (state) {
+            case SLOTS_START:
+                if (redis_parse_number(&mbuf, &p, '*', &slot_ranges) == NC_OK) {
+                    state = SLOTS_RANGE;
+                } else {
+                    goto error;
+                }
+                break;
+            case SLOTS_RANGE:
+                if (redis_parse_number(&mbuf, &p, '*', &slot_elements) == NC_OK) {
+                    if (slot_elements < 3) {
+                        log_error("Expected at least 3 items in slot, got %d", slot_elements);
+                        goto error;
+                    }
+                    mapping = array_push(&slots);
+                    state = SLOTS_LO_SLOT;
+                    slot_elements = 0;
+                    range_count++;
+                } else {
+                    goto error;
+                }
+                break;
+            case SLOTS_LO_SLOT:
+                if (redis_parse_number(&mbuf, &p, ':', &(mapping->lo_slot)) == NC_OK) {
+                    state = SLOTS_HI_SLOT;
+                    slot_elements--;
+                } else {
+                    goto error;
+                }
+                break;
+            case SLOTS_HI_SLOT:
+                if (redis_parse_number(&mbuf, &p, ':', &(mapping->hi_slot)) == NC_OK) {
+                    state = SLOTS_MASTER;
+                    slot_elements--;
+                } else {
+                    goto error;
+                }
+            case SLOTS_MASTER:
+                if (redis_parse_number(&mbuf, &p, '*', &master_elements) == NC_OK) {
+                    if (master_elements != 2) {
+                        log_error("Expected only two elements for master definition in slot %d (%d to %d), got %d",
+                            range_count, mapping->lo_slot, mapping->hi_slot, master_elements);
+                        goto error;
+                    }
+                    state = SLOTS_MASTER_IP;
+                    slot_elements--;
+                } else {
+                    goto error;
+                }
+                break;
+            case SLOTS_MASTER_IP:
+                if (ch == '+') {
+                    state = SLOTS_MASTER_IP_ARG;
+                    string_init(&mapping->host);
+                    master_ip_pos = 0;
+                } else {
+                    goto error;
+                }
+                break;
+            case SLOTS_MASTER_IP_ARG:
+                if (ch == CR) {
+                    state = SLOTS_MASTER_IP_LF;
+                } else {
+                    if (master_ip_pos < sizeof(master_ip) - 1) {
+                        master_ip[master_ip_pos++] = ch;
+                    } else {
+                        master_ip[master_ip_pos] = 0;
+                        log_error("Master IP address was too long in slot %d (%d to %d), got %.*s...",
+                            range_count, mapping->lo_slot, mapping->hi_slot, master_ip_pos, master_ip);
+                        goto error;
+                    }
+                }
+                break;
+            case SLOTS_MASTER_IP_LF:
+                if (ch == LF) {
+                    master_ip[master_ip_pos] = 0;
+                    string_copy(&mapping->host, master_ip, master_ip_pos);
+                    state = SLOTS_MASTER_PORT;
+                } else {
+                    goto error;
+                }
+                break;
+            case SLOTS_MASTER_PORT:
+                if (redis_parse_number(&mbuf, &p, ':', &(mapping->port)) == NC_OK) {
+                    if (++range_count == slot_ranges) {
+                        goto done;
+                    } else if (slot_elements > 0) {
+                        state = SLOTS_SKIP_SLAVE;
+                    } else {
+                        slot_elements = 0;
+                        state = SLOTS_LO_SLOT;
+                    }
+                } else {
+                    goto error;
+                }
+                break;
+            case SLOTS_SKIP_SLAVE:
+                if (ch == LF) {
+                    --slot_elements;
+                    if (slot_elements <= 0) {
+                        slot_elements = 0;
+                        state = SLOTS_LO_SLOT;
+                    }
+                }
+                break;
+            }
+        }
+    }
+
+done:
+    pool->cluster_discovery = false;
+    redis_on_cluster_slots_result(pool, &slots);
+    array_deinit(&slots);
+    return NC_OK;
+error:
+    array_deinit(&slots);
+    return NC_ERROR;
+}
+
+rstatus_t
+conf_reconfigure_pool(struct server_pool *pool);
+
+/*
+ * Sends CLUSTER SLOTS command to next server in the pool. If all servers have been tried with failure,
+ * server pool is re-initialized.
+ */
+void
+redis_send_cluster_slots_next_server(struct server_pool* pool, struct server *last_server)
+{
+    uint32_t nserver;
+    uint32_t server_index;
+    struct server *server_to_use;
+
+    ASSERT(pool != NULL);
+    ASSERT(array_n(&pool->server) != 0);
+
+    nserver = array_n(&pool->server);
+
+    server_to_use = array_get(&pool->server, 0);
+    if (last_server != NULL) {
+        for (server_index = 1; server_index < nserver; server_index++) {
+            struct server *server = array_get(&pool->server, server_index);
+            if (last_server == server) {
+                if (server_index < nserver - 1) {
+                    server_to_use = array_get(&pool->server, server_index+1);
+                    break;
+                } else {
+                    /* No server responded, we need to re-initialize completely here! */
+                    /* resolve IP address */
+                    /* fill new pool */
+                    /* restart */
+                    conf_reconfigure_pool(pool);
+
+                    return;
+                }
+            }
+        }
+    }
+    if (server_to_use != NULL) {
+        redis_send_cluster_slots(pool->ctx, server_conn(server_to_use), server_to_use);
+    }
+}
+
+void
+redis_send_cluster_slots(struct context *ctx, struct conn *conn, struct server *server)
+{
+    rstatus_t status;
+    struct server_pool *pool = server->owner;
+    struct msg *msg;
+
+    ASSERT(conn != NULL);
+    ASSERT(!conn->client && conn->connected);
+    ASSERT(conn->redis);
+
+    pool->cluster_discovery = true;
+
+    /*
+     * Create a fake client message and add it to the pipeline. We force this
+     * message to be head of queue as it might already contain a command
+     * that triggered the connect.
+     */
+    msg = msg_get(conn, true, conn->redis);
+    if (msg == NULL) {
+        return;
+    }
+
+    status = msg_prepend_format(msg, "*2\r\n$7\r\nCLUSTER\r\n$5\r\nSLOTS\r\n");
+    if (status != NC_OK) {
+        msg_put(msg);
+        return;
+    }
+    msg->type = MSG_REQ_REDIS_CLUSTER_SLOTS;
+    msg->result = MSG_PARSE_OK;
+    msg->swallow = 1;
+    msg->owner = NULL;
+
+
+    /* enqueue as head and send */
+    req_server_enqueue_imsgq_head(ctx, conn, msg);
+    msg_send(ctx, conn);
+
+    log_debug(LOG_NOTICE, "sent 'CLUSTER SLOTS' to %s | %s",
+              pool->name.data, server->name.data);
+}
+
+int
+order_by_low_slot(const void *a, const void *b)
+{
+    return ((struct slot_mapping *)a)->lo_slot - ((struct slot_mapping *)b)->lo_slot;
+}
+
+struct server *
+server_find_by_address(struct server_pool *pool, struct string *addr, int port)
+{
+    uint32_t nserver;
+    uint32_t server_index;
+
+    ASSERT(pool != NULL);
+    ASSERT(addr != NULL);
+
+    nserver = array_n(&pool->server);
+
+    for (server_index = 0; server_index < nserver; server_index++) {
+        struct server *server = array_get(&pool->server, server_index);
+        if (port == server->port && !string_compare(&server->addrstr, addr)) {
+            return server;
+        }
+    }
+    return NULL;
+}
+
+rstatus_t
+server_add_to_pool(struct server_pool *pool, struct string *addr, int port) {
+    struct server *s;
+    static uint8_t pname[NI_MAXHOST + NI_MAXSERV];
+    int pname_len;
+    rstatus_t status;
+
+    pname_len = nc_snprintf(pname, sizeof(pname), "%.*s:%d", addr->len, addr->data, port);
+
+    s = array_push(&pool->server);
+    ASSERT(s != NULL);
+
+    s->idx = array_idx(&pool->server, s);
+    s->owner = NULL;
+
+    status = string_duplicate(&s->addrstr, addr);
+    if (status != NC_OK) {
+        return status;
+    }
+    status = string_duplicate(&s->name, addr);
+    if (status != NC_OK) {
+        return status;
+    }
+    status = string_copy(&s->pname, pname, pname_len);
+    if (status != NC_OK) {
+        return status;
+    }
+    s->port = (uint16_t)port;
+    s->weight = (uint32_t)1;
+
+    status = nc_resolve(&s->name, s->port, &s->info);
+    if (status != NC_OK) {
+        return status;
+    }
+
+    s->ns_conn_q = 0;
+    TAILQ_INIT(&s->s_conn_q);
+
+    s->next_retry = 0LL;
+    s->failure_count = 0;
+    s->owner = pool;
+
+    log_debug(LOG_DEBUG, "added server '%.*s' to servers in pool %"PRIu32" '%.*s'",
+              s->pname.len, s->pname.data, pool->idx, pool->name.len, pool->name.data);
+    return NC_OK;
+}
+
+uint32_t
+server_find_by_address_or_add(struct server_pool *pool, struct string *addr, int port)
+{
+    struct server *server;
+
+    server = server_find_by_address(pool, addr, port);
+    if (server == NULL) {
+        rstatus_t status;
+        status = server_add_to_pool(pool, addr, port);
+        if (status != NC_OK) {
+            log_error("failed to add server to in pool %"PRIu32" '%.*s', error %d",
+                pool->idx, pool->name.len, pool->name.data, status);
+            return -1;
+        }
+        server = server_find_by_address(pool, addr, port);
+    }
+    return server->idx;
+}
+
+rstatus_t
+redis_on_cluster_slots_result(struct server_pool *pool, struct array *slot_responses)
+{
+    uint32_t nresponses;
+    uint32_t response_index;
+    uint32_t continuum_index;
+    uint32_t continuum_count;
+    uint32_t server_index;
+    uint32_t prev_slot;
+    struct continuum *continuum;
+
+    ASSERT(pool != NULL);
+    ASSERT(slot_responses != NULL);
+
+    array_sort(slot_responses, order_by_low_slot);
+
+    nresponses = array_n(slot_responses);
+    // check if contigous - if not add to continuum_count number of gaps servers
+    prev_slot = 0;
+    continuum_count = nresponses;
+    for (response_index = 0; response_index < nresponses; response_index++) {
+        struct slot_mapping *slot = array_get(slot_responses, response_index);
+        if (slot->lo_slot > prev_slot) {
+            continuum_count++;
+        }
+        prev_slot = slot->hi_slot;
+    }
+    if (prev_slot != 16383) {
+        continuum_count++;
+    }
+
+    continuum = nc_realloc(pool->continuum, sizeof(*continuum) * continuum_count);
+    if (continuum == NULL) {
+        return NC_ENOMEM;
+    }
+
+    continuum_index = 0;
+    pool->continuum = continuum;
+    pool->nserver_continuum = continuum_count;
+
+    prev_slot = 0;
+    for (response_index = 0; response_index < nresponses; response_index++) {
+        struct slot_mapping *slot = array_get(slot_responses, response_index);
+        // if slots aren't contigous (missing range) add null servers
+        if (slot->lo_slot > prev_slot) {
+            pool->continuum[continuum_index].index = -1;
+            pool->continuum[continuum_index++].value = slot->lo_slot-1;
+        }
+        server_index = server_find_by_address_or_add(pool, &slot->host, slot->port);
+        pool->continuum[continuum_index].index = server_index;
+        pool->continuum[continuum_index++].value = slot->hi_slot;
+        prev_slot = slot->hi_slot;
+    }
+
+    return NC_OK;
+}
+

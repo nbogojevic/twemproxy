@@ -121,6 +121,8 @@ struct server_pool {
     unsigned           preconnect:1;         /* preconnect? */
     unsigned           redis:1;              /* redis? */
     unsigned           tcpkeepalive:1;       /* tcpkeepalive? */
+    unsigned           redis_cluster:1;      /* redis_cluster? */
+    unsigned           cluster_discovery:1;  /* cluster discovery is going on? */
 };
 
 void server_ref(struct conn *conn, void *owner);
@@ -142,5 +144,7 @@ rstatus_t server_pool_preconnect(struct context *ctx);
 void server_pool_disconnect(struct context *ctx);
 rstatus_t server_pool_init(struct array *server_pool, struct array *conf_pool, struct context *ctx);
 void server_pool_deinit(struct array *server_pool);
+
+void sever_pool_release(struct server_pool *pool);
 
 #endif
