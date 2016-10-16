@@ -12,6 +12,9 @@ usage
     pip install nose
     pip install git+https://github.com/andymccurdy/redis-py.git@2.10.3
     pip install git+https://github.com/idning/python-memcached.git#egg=memcache
+    #NBO
+    pip install git+https://github.com/Grokzen/redis-py-cluster.git@1.1.0
+    #NBO End
 
 2. copy binarys to _binaries/::
 

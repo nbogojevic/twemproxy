@@ -193,6 +193,17 @@ class RedisServer(Base):
         logging.info('%s %s' % (self, cmd))
         return self._run(cmd)
 
+class RedisClusterServer(RedisServer):
+    def __init__(self, host, port, path, cluster_name, server_name, auth = None):
+        RedisServer.__init__(self, host, port, path, cluster_name, server_name, auth)
+
+    def _gen_conf(self):
+        content = file(os.path.join(WORKDIR, 'conf/redis_cluster.conf')).read()
+        content = TT(content, self.args)
+        if self.args['auth']:
+            content += '\r\nrequirepass %s' % self.args['auth']
+        return content
+
 class Memcached(Base):
     def __init__(self, host, port, path, cluster_name, server_name):
         Base.__init__(self, 'memcached', host, port, path)
