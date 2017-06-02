@@ -1948,6 +1948,16 @@ redis_parse_rsp(struct msg *r)
                         break;
                     }
 
+
+                    break;
+
+                case 12:
+                    /* -CLUSTERDOWN CLUSTER is not in consistent state.\r\n */
+                    if (str11cmp(m, '-', 'C', 'L', 'U', 'S', 'T', 'E', 'R', 'D', 'O', 'W', 'N')) {
+                        r->type = MSG_RSP_REDIS_ERROR_CLUSTERDOWN;
+                        break;
+                    }
+
                     break;
                 }
                 state = SW_RUNTO_CRLF;

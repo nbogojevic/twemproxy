@@ -191,6 +191,7 @@ typedef enum msg_parse_result {
     ACTION( RSP_REDIS_ERROR_MOVED )                                                                 \
     ACTION( RSP_REDIS_ERROR_ASK )                                                                   \
     ACTION( REQ_REDIS_CLUSTER_SLOTS )                                                               \
+    ACTION( RSP_REDIS_ERROR_CLUSTERDOWN )                                                           \
 
 
 #define DEFINE_ACTION(_name) MSG_##_name,
