@@ -346,6 +346,7 @@ redis_error(struct msg *r)
     case MSG_RSP_REDIS_ERROR_MASTERDOWN:
     case MSG_RSP_REDIS_ERROR_NOREPLICAS:
     case MSG_RSP_REDIS_ERROR_TRYAGAIN:
+    case MSG_RSP_REDIS_ERROR_CLUSTERDOWN:
         return true;
 
     default:
@@ -1953,7 +1954,7 @@ redis_parse_rsp(struct msg *r)
 
                 case 12:
                     /* -CLUSTERDOWN CLUSTER is not in consistent state.\r\n */
-                    if (str11cmp(m, '-', 'C', 'L', 'U', 'S', 'T', 'E', 'R', 'D', 'O', 'W', 'N')) {
+                    if (str12cmp(m, '-', 'C', 'L', 'U', 'S', 'T', 'E', 'R', 'D', 'O', 'W', 'N')) {
                         r->type = MSG_RSP_REDIS_ERROR_CLUSTERDOWN;
                         break;
                     }
@@ -2313,6 +2314,7 @@ redis_failure(struct msg *r)
     case MSG_RSP_REDIS_ERROR_OOM:
     case MSG_RSP_REDIS_ERROR_BUSY:
     case MSG_RSP_REDIS_ERROR_LOADING:
+    case MSG_RSP_REDIS_ERROR_CLUSTERDOWN:
         return true;
 
     default:
