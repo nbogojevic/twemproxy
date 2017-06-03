@@ -16,9 +16,6 @@ import conf
 from server_modules import *
 from utils import *
 
-import os
-import conf
-
 CLUSTER_NAME = 'ntest'
 nc_verbose = int(getenv('T_VERBOSE', 5))
 mbuf = int(getenv('T_MBUF', 512))
@@ -39,23 +36,26 @@ all_redis = [
 startup_nodes =  [{"host": "127.0.0.1", "port": "2100"}, {"host": "127.0.0.1", "port": "2101"}, {"host": "127.0.0.1", "port": "2102"}, {"host": "127.0.0.1", "port": "2103"}, {"host": "127.0.0.1", "port": "2104"}, {"host": "127.0.0.1", "port": "2105"}]
 
 
-nc = NutCracker('127.0.0.1', 4100, '/tmp/r/nutcracker-4100', CLUSTER_NAME,
-                all_redis, mbuf=mbuf, verbose=nc_verbose)
+nc = NutCrackerRedisCluster('127.0.0.1', 4100, '/tmp/r/nutcracker-4100', CLUSTER_NAME,
+                all_redis, mbuf=mbuf, verbose=9)
 
 def setup():
     print 'setup(mbuf=%s, verbose=%s)' %(mbuf, nc_verbose)
-    cluster_servers = '' 
     for r in all_redis + [nc]:
         r.clean()
         r.deploy()
         r.stop()
         r.start()
+    cluster_servers = '' 
+    for r in all_redis:
         cluster_servers = cluster_servers + " %s:%d" % (r.host(), r.port()) 
     os.system("ruby " + redis_trib + " create --replicas 1 " + cluster_servers)
 
     rc = StrictRedisCluster(startup_nodes=startup_nodes)
 
 def teardown():
+    log = file(nc.logfile()).read()
+    logging.info(log)
     for r in all_redis + [nc]:
         assert(r._alive())
         r.stop()

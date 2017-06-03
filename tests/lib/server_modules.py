@@ -330,3 +330,32 @@ $cluster_name:
 
         self.reload()
 
+class NutCrackerRedisCluster(NutCracker):
+    def __init__(self, host, port, path, cluster_name, masters, mbuf=512,
+            verbose=5, is_redis=True, redis_auth=None):
+        NutCracker.__init__(self, host, port, path, cluster_name, masters, mbuf,
+            verbose, is_redis, redis_auth)
+
+    def _gen_conf(self):
+        content = '''
+$cluster_name:
+  listen: 0.0.0.0:$port
+  hash: redis_slot
+  distribution: redis_slot
+  preconnect: true
+  auto_eject_hosts: false
+  redis: $is_redis
+  backlog: 512
+  timeout: 400
+  client_connections: 0
+  server_connections: 1
+  server_retry_timeout: 2000
+  server_failure_limit: 2
+  servers:
+'''
+        if self.args['redis_auth']:
+            content = content.replace('redis: $is_redis',
+                    'redis: $is_redis\r\n  redis_auth: $redis_auth')
+        content = TT(content, self.args)
+        return content + self._gen_conf_section()
+

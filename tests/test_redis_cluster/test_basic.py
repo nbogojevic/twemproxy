@@ -7,6 +7,7 @@ def test_setget():
     r = getconn()
 
     rst = r.set('k', 'v')
+    
     assert(r.get('k') == 'v')
 
 def atest_msetnx():
