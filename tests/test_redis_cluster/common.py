@@ -33,8 +33,8 @@ all_redis = [
         RedisClusterServer('127.0.0.1', 2101, '/tmp/r/redis-2101/', CLUSTER_NAME, 'redis-2101'),
         RedisClusterServer('127.0.0.1', 2102, '/tmp/r/redis-2102/', CLUSTER_NAME, 'redis-2102'),
         RedisClusterServer('127.0.0.1', 2103, '/tmp/r/redis-2103/', CLUSTER_NAME, 'redis-2103'),
-        RedisClusterServer('127.0.0.1', 2104, '/tmp/r/redis-2102/', CLUSTER_NAME, 'redis-2104'),
-        RedisClusterServer('127.0.0.1', 2105, '/tmp/r/redis-2103/', CLUSTER_NAME, 'redis-2105'),
+        RedisClusterServer('127.0.0.1', 2104, '/tmp/r/redis-2104/', CLUSTER_NAME, 'redis-2104'),
+        RedisClusterServer('127.0.0.1', 2105, '/tmp/r/redis-2105/', CLUSTER_NAME, 'redis-2105'),
         ]
 startup_nodes =  [{"host": "127.0.0.1", "port": "2100"}, {"host": "127.0.0.1", "port": "2101"}, {"host": "127.0.0.1", "port": "2102"}, {"host": "127.0.0.1", "port": "2103"}, {"host": "127.0.0.1", "port": "2104"}, {"host": "127.0.0.1", "port": "2105"}]
 
