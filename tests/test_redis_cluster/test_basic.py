@@ -9,14 +9,14 @@ def test_setget():
     rst = r.set('k', 'v')
     assert(r.get('k') == 'v')
 
-def test_msetnx():
+def atest_msetnx():
     r = getconn()
 
     #not supported
     keys = default_kv.keys()
     assert_fail('Socket closed|Connection closed', r.msetnx,**default_kv)
 
-def test_null_key():
+def atest_null_key():
     r = getconn()
     rst = r.set('', 'v')
     assert(r.get('') == 'v')
@@ -28,7 +28,7 @@ def test_null_key():
     ret = r.mset(**kv)
     assert(r.get('') == 'val')
 
-def test_ping_quit():
+def atest_ping_quit():
     r = getconn()
     assert(r.ping() == True)
 
@@ -38,7 +38,7 @@ def test_ping_quit():
 
     assert_fail('Socket closed|Connection closed', r.execute_command, 'QUIT')
 
-def test_slow_req():
+def atest_slow_req():
     r = getconn()
 
     kv = {'mkkk-%s' % i : 'mvvv-%s' % i for i in range(500000)}
@@ -52,7 +52,7 @@ def test_slow_req():
 
     assert_fail('timed out', pipe.execute)
 
-def test_signal():
+def atest_signal():
     #init
     nc.cleanlog()
     nc.signal('HUP')
@@ -73,7 +73,7 @@ def test_signal():
     #recover
     nc.start()
 
-def test_nc_stats():
+def atest_nc_stats():
     nc.stop() #reset counters
     nc.start()
     r = getconn()
@@ -112,7 +112,7 @@ def test_nc_stats():
     assert(get_stat('requests') == 22)
     assert(get_stat('responses') == 22)
 
-def test_issue_323():
+def atest_issue_323():
     # do on redis
     r = all_redis[0]
     c = redis.Redis(r.host(), r.port())
