@@ -26,6 +26,7 @@ usage
     |-- redis-cli
     |-- redis-sentinel
     |-- redis-server
+    |-- redis-trib.rb
     |-- memcached
 
 3. run::
